@@ -19,7 +19,7 @@ Not yet included (planned for later versions): tools, GitHub/Vercel integration,
 
 - [Next.js](https://nextjs.org) (App Router) + React + TypeScript
 - One API route: `POST /api/chat` (streams the assistant reply)
-- Provider layer: any **OpenAI-compatible** Chat Completions API (OpenAI, OpenRouter, Groq, DeepSeek, …)
+- Provider layer: **Ryzumi AI** via its OpenAI-compatible Chat Completions API
 - No database — the backend is stateless; the client sends the current conversation with each request
 
 ```
@@ -30,7 +30,7 @@ app/
   api/chat/route.ts   # Chat API: validation, streaming, error handling
 lib/ai/
   types.ts            # AIProvider interface + ChatMessage types
-  provider.ts         # OpenAI-compatible provider implementation + factory
+  provider.ts         # Ryzumi provider implementation + factory
   systemPrompt.ts     # Raphael's identity (v0.1)
 ```
 
@@ -38,7 +38,7 @@ lib/ai/
 
 ```bash
 npm install
-cp .env.example .env.local   # then fill in AI_API_KEY
+cp .env.example .env.local   # then fill in RYZUMI_API_KEY, RYZUMI_BASE_URL, RYZUMI_MODEL
 npm run dev                  # http://localhost:3000
 ```
 
@@ -53,29 +53,32 @@ npx tsc --noEmit  # type check
 
 ## Environment variables
 
-| Variable      | Required | Default                     | Description                                              |
-| ------------- | -------- | --------------------------- | -------------------------------------------------------- |
-| `AI_API_KEY`  | ✅ yes   | —                           | Secret key for the AI provider. Server-side only.        |
-| `AI_BASE_URL` | no       | `https://api.openai.com/v1` | Base URL of any OpenAI-compatible Chat Completions API.  |
-| `AI_MODEL`    | no       | `gpt-4o-mini`               | Model id sent to the provider.                           |
+All variables below are **required** — Raphael will not guess an endpoint or model, so each must be set explicitly.
 
-All variables are read **only on the server** (inside the API route). None are prefixed with `NEXT_PUBLIC_`, so they are never bundled into client code. If `AI_API_KEY` is missing, the API returns a clear 503 error instead of crashing.
+| Variable           | Required | Description                                                                 |
+| ------------------ | -------- | --------------------------------------------------------------------------- |
+| `RYZUMI_API_KEY`   | ✅ yes   | Secret key for the Ryzumi AI API. Server-side only.                         |
+| `RYZUMI_BASE_URL`  | ✅ yes   | Base URL of Ryzumi's OpenAI-compatible Chat Completions API (e.g. `…/v1`).  |
+| `RYZUMI_MODEL`     | ✅ yes   | Model id sent to Ryzumi, passed exactly as configured.                      |
 
-Provider examples:
+All variables are read **only on the server** (inside the API route). None are prefixed with `NEXT_PUBLIC_`, so they are never bundled into client code. If any of `RYZUMI_API_KEY`, `RYZUMI_BASE_URL`, or `RYZUMI_MODEL` is missing, the API returns a clear 503 error instead of crashing.
 
-| Provider   | `AI_BASE_URL`                  | Example `AI_MODEL`          |
-| ---------- | ------------------------------ | ---------------------------- |
-| OpenAI     | `https://api.openai.com/v1`    | `gpt-4o-mini`               |
-| OpenRouter | `https://openrouter.ai/api/v1` | `openai/gpt-4o-mini`        |
-| Groq       | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
-| DeepSeek   | `https://api.deepseek.com/v1`  | `deepseek-chat`             |
+### Example configuration
+
+```bash
+RYZUMI_API_KEY=your-ryzumi-api-key
+RYZUMI_BASE_URL=https://api.ryzumi.example.com/v1
+RYZUMI_MODEL=your-ryzumi-model-id
+```
+
+Replace the placeholders with the exact base URL and model id provided by Ryzumi. The model id is sent to the API verbatim.
 
 ## Production (Vercel)
 
 1. Push this repository to GitHub.
 2. In [Vercel](https://vercel.com), **Add New Project** → import the repo.
 3. Framework preset: **Next.js** (auto-detected). Build command `next build`, output handled automatically — no custom configuration needed.
-4. Add the environment variables (`AI_API_KEY`, optionally `AI_BASE_URL`, `AI_MODEL`) under **Settings → Environment Variables** for the Production (and Preview) environments.
+4. Add the environment variables (`RYZUMI_API_KEY`, `RYZUMI_BASE_URL`, `RYZUMI_MODEL`) under **Settings → Environment Variables** for the Production (and Preview) environments.
 5. Deploy.
 
 The chat route runs on the Node.js runtime with a 60s max duration (set via `maxDuration` in `app/api/chat/route.ts`).

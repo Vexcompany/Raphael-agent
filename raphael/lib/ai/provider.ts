@@ -1,21 +1,21 @@
 import { AIProvider, AIProviderError, ChatMessage } from "./types";
 
 /**
- * OpenAI-compatible chat-completions provider.
+ * OpenAI-compatible chat-completions provider for Ryzumi AI.
  *
- * Works with any service exposing the OpenAI Chat Completions API:
- * OpenAI, OpenRouter, Groq, DeepSeek, Together, local gateways, etc.
+ * Ryzumi exposes an OpenAI-compatible Chat Completions interface, so this
+ * implementation reuses the standard OpenAI streaming wire format.
  *
  * Configured entirely via environment variables (see README):
- *   AI_API_KEY   - secret key (server-side only, required)
- *   AI_BASE_URL  - API base URL (default: https://api.openai.com/v1)
- *   AI_MODEL     - model id   (default: gpt-4o-mini)
+ *   RYZUMI_API_KEY   - secret key (server-side only, required)
+ *   RYZUMI_BASE_URL  - Ryzumi API base URL (required, no default)
+ *   RYZUMI_MODEL     - Ryzumi model id (required, no default)
  */
 
 const REQUEST_TIMEOUT_MS = 60_000;
 
-class OpenAICompatibleProvider implements AIProvider {
-  name = "openai-compatible";
+class RyzumiProvider implements AIProvider {
+  name = "ryzumi";
 
   private apiKey: string;
   private baseUrl: string;
@@ -131,18 +131,30 @@ function extractDelta(chunk: unknown): string | null {
 }
 
 /**
- * Factory: returns the configured provider or throws a safe error if
- * the server is missing configuration.
+ * Factory: returns the configured Ryzumi provider or throws a safe error
+ * if the server is missing configuration.
  */
 export function getProvider(): AIProvider {
-  const apiKey = process.env.AI_API_KEY;
+  const apiKey = process.env.RYZUMI_API_KEY;
   if (!apiKey) {
     throw new AIProviderError(
-      "The server is not configured with an AI API key.",
+      "The server is not configured with a Ryzumi API key.",
       503
     );
   }
-  const baseUrl = process.env.AI_BASE_URL || "https://api.openai.com/v1";
-  const model = process.env.AI_MODEL || "gpt-4o-mini";
-  return new OpenAICompatibleProvider(apiKey, baseUrl, model);
+  const baseUrl = process.env.RYZUMI_BASE_URL;
+  if (!baseUrl) {
+    throw new AIProviderError(
+      "The server is not configured with a Ryzumi API base URL.",
+      503
+    );
+  }
+  const model = process.env.RYZUMI_MODEL;
+  if (!model) {
+    throw new AIProviderError(
+      "The server is not configured with a Ryzumi model.",
+      503
+    );
+  }
+  return new RyzumiProvider(apiKey, baseUrl, model);
 }
