@@ -1,4 +1,4 @@
-import { AIProvider, AIProviderError, ChatMessage } from "./types";
+import { AIProvider, AIProviderError, ModelUnavailableError, ChatMessage } from "./types";
 
 /**
  * OpenAI-compatible chat-completions provider for Ryzumi AI.
@@ -6,13 +6,39 @@ import { AIProvider, AIProviderError, ChatMessage } from "./types";
  * Ryzumi exposes an OpenAI-compatible Chat Completions interface, so this
  * implementation reuses the standard OpenAI streaming wire format.
  *
- * Configured entirely via environment variables (see README):
+ * Configured via environment variables (see README):
  *   RYZUMI_API_KEY   - secret key (server-side only, required)
  *   RYZUMI_BASE_URL  - Ryzumi API base URL (required, no default)
- *   RYZUMI_MODEL     - Ryzumi model id (required, no default)
+ *
+ * The model is chosen per request and passed to getProvider(model); it is
+ * validated by the chat route against the model registry before it reaches
+ * this provider. No model id is hardcoded here.
  */
 
 const REQUEST_TIMEOUT_MS = 60_000;
+
+/** Upstream error patterns that mean "this model is not usable right now". */
+const MODEL_UNAVAILABLE_PATTERNS = [
+  /model\b.*\bnot found\b/i,
+  /model_not_found/i,
+  /no such model/i,
+  /unknown model/i,
+  /invalid model/i,
+  /model.*does not exist/i,
+  /model.*is not available/i,
+  /model.*unavailable/i,
+  /model.*out of stock/i,
+  /model.*out-of-stock/i,
+  /out of stock/i,
+  /insufficient stock/i,
+  /sold out/i,
+  /has been retired/i,
+  /has been deprecated/i,
+];
+
+function looksLikeModelUnavailable(body: string): boolean {
+  return MODEL_UNAVAILABLE_PATTERNS.some((re) => re.test(body));
+}
 
 class RyzumiProvider implements AIProvider {
   name = "ryzumi";
@@ -62,8 +88,21 @@ class RyzumiProvider implements AIProvider {
     }
 
     if (!res.ok) {
-      // Never forward the provider's raw body to the client — it can
-      // contain internal details. Map to a safe message instead.
+      // Read the body ONLY to classify the failure — the raw body may
+      // contain internal details and is never forwarded to the client.
+      let bodyText = "";
+      try {
+        bodyText = (await res.text()).slice(0, 4096);
+      } catch {
+        bodyText = "";
+      }
+
+      if (looksLikeModelUnavailable(bodyText)) {
+        // Treat upstream model-not-found / out-of-stock as availability
+        // information so the client can disable the model and refresh.
+        throw new ModelUnavailableError(this.model);
+      }
+
       if (res.status === 401 || res.status === 403) {
         throw new AIProviderError(
           "The AI provider rejected the server credentials.",
@@ -131,10 +170,11 @@ function extractDelta(chunk: unknown): string | null {
 }
 
 /**
- * Factory: returns the configured Ryzumi provider or throws a safe error
- * if the server is missing configuration.
+ * Factory: returns a configured Ryzumi provider for the given model id, or
+ * throws a safe error if the server is missing configuration. The model id
+ * is passed exactly as configured and must be validated by the caller.
  */
-export function getProvider(): AIProvider {
+export function getProvider(model: string): AIProvider {
   const apiKey = process.env.RYZUMI_API_KEY;
   if (!apiKey) {
     throw new AIProviderError(
@@ -146,13 +186,6 @@ export function getProvider(): AIProvider {
   if (!baseUrl) {
     throw new AIProviderError(
       "The server is not configured with a Ryzumi API base URL.",
-      503
-    );
-  }
-  const model = process.env.RYZUMI_MODEL;
-  if (!model) {
-    throw new AIProviderError(
-      "The server is not configured with a Ryzumi model.",
       503
     );
   }

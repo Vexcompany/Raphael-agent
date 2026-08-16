@@ -97,6 +97,244 @@ body {
   cursor: not-allowed;
 }
 
+.headerRight {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* ---------- Model selector ---------- */
+
+.modelPicker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.modelPickerLabel {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.modelPickerBtn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 0.85rem;
+  padding: 7px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 180px;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.modelPickerBtn:hover {
+  background: var(--bg-input);
+  border-color: var(--accent);
+}
+
+.modelPickerName {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.modelCaret {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--text-dim);
+  transition: transform 0.15s ease;
+}
+
+.modelPickerBtn[aria-expanded="true"] .modelCaret {
+  transform: rotate(180deg);
+}
+
+.modelDropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  width: min(340px, calc(100vw - 32px));
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  padding: 8px;
+}
+
+.modelDropdownTop {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 6px 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+  background: var(--bg-elevated);
+}
+
+.modelDropdownTitle {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.modelRefreshBtn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 0.75rem;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.modelRefreshBtn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.modelRefreshBtn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.modelGroupLabel {
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  padding: 8px 6px 4px;
+}
+
+.modelRow {
+  appearance: none;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.87rem;
+  padding: 7px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.modelRow:hover:not(:disabled) {
+  background: var(--bg-input);
+}
+
+.modelRowDisabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.modelRowSelected {
+  background: rgba(122, 162, 247, 0.12);
+}
+
+.modelDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.modelDotActive {
+  background: #7ee2a8;
+  box-shadow: 0 0 0 3px rgba(126, 226, 168, 0.15);
+}
+
+.modelDotOut {
+  background: transparent;
+  border: 1.5px solid var(--text-dim);
+}
+
+.modelRowName {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.modelStatus {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+
+.modelStatusActive {
+  color: #7ee2a8;
+}
+
+.modelStatusOut {
+  color: var(--text-dim);
+}
+
+.modelDropdownFoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 6px 2px;
+  border-top: 1px solid var(--border);
+  margin-top: 6px;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+
+.modelNotice {
+  padding: 8px 16px;
+  background: rgba(244, 184, 96, 0.12);
+  border-bottom: 1px solid var(--border);
+  color: #f4b860;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.modelNoticeBtn {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
 /* ---------- Messages ---------- */
 
 .messages {
@@ -417,4 +655,6 @@ body {
   .msg.user .msgBody { max-width: 92%; }
   .hint { display: none; }
   .brand span { display: none; }
+  .modelPickerLabel { display: none; }
+  .modelPickerBtn { max-width: 140px; }
 }

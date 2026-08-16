@@ -18,8 +18,33 @@ interface Message {
   content: string;
 }
 
+type ModelAvailability = "active" | "out_of_stock";
+
+interface ModelInfo {
+  id: string;
+  displayName: string;
+  availability: ModelAvailability;
+  group: string;
+}
+
 const STORAGE_KEY = "raphael:conversation:v1";
+const MODEL_STORAGE_KEY = "raphael:model:v1";
 const STREAM_ERROR_MARKER = "[RAPHAEL_STREAM_ERROR]";
+const MODEL_UNAVAILABLE_MARKER = "[RAPHAEL_MODEL_UNAVAILABLE]";
+const DEFAULT_MODEL = "auto";
+
+const GROUP_ORDER = [
+  "Auto",
+  "Claude",
+  "GPT",
+  "DeepSeek",
+  "Qwen",
+  "Kimi",
+  "GLM",
+  "Grok",
+  "Mistral",
+  "Other",
+];
 
 function loadStoredMessages(): Message[] {
   try {
@@ -39,6 +64,47 @@ function loadStoredMessages(): Message[] {
   }
 }
 
+function loadStoredModel(): string | null {
+  try {
+    const raw = window.localStorage.getItem(MODEL_STORAGE_KEY);
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isModelInfo(v: unknown): v is ModelInfo {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as ModelInfo).id === "string" &&
+    typeof (v as ModelInfo).displayName === "string" &&
+    ((v as ModelInfo).availability === "active" ||
+      (v as ModelInfo).availability === "out_of_stock") &&
+    typeof (v as ModelInfo).group === "string"
+  );
+}
+
+interface ModelGroup {
+  group: string;
+  models: ModelInfo[];
+}
+
+function groupModels(models: ModelInfo[]): ModelGroup[] {
+  const map = new Map<string, ModelInfo[]>();
+  for (const g of GROUP_ORDER) map.set(g, []);
+  for (const m of models) {
+    if (!map.has(m.group)) map.set(m.group, []);
+    map.get(m.group)!.push(m);
+  }
+  return GROUP_ORDER.filter((g) => (map.get(g)?.length ?? 0) > 0).map((g) => ({
+    group: g,
+    models: map.get(g)!,
+  }));
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -47,19 +113,78 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
 
+  // Model selector state.
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [modelsSource, setModelsSource] = useState<"ryzumi" | "fallback" | null>(null);
+  const [modelsRefreshedAt, setModelsRefreshedAt] = useState<number | null>(null);
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL);
+  const [selectorOpen, setSelectorOpen] = useState(false);
+  const [modelsRefreshing, setModelsRefreshing] = useState(false);
+  const [modelNotice, setModelNotice] = useState<string | null>(null);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const lastUserMessageRef = useRef<string | null>(null);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const selectedModelRef = useRef<string>(DEFAULT_MODEL);
 
-  // Restore the current conversation after a refresh. This must happen
-  // post-mount (localStorage does not exist during SSR), so a synchronous
-  // setState in this one effect is intentional.
+  // Keep a plain ref in sync so async callbacks (refreshModels) can read the
+  // latest selection without stale-closure issues.
   useEffect(() => {
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
+
+  // Restore the current conversation and model selection after a refresh.
+  // This must happen post-mount (localStorage does not exist during SSR), so
+  // a synchronous setState in this one effect is intentional.
+  const refreshModels = useCallback(async (force: boolean) => {
+    setModelsRefreshing(true);
+    try {
+      const res = await fetch(`/api/models${force ? "?refresh=1" : ""}`, {
+        cache: "no-store",
+      });
+      if (!res.ok) return;
+      const data: unknown = await res.json();
+      if (typeof data !== "object" || data === null) return;
+      const d = data as { models?: unknown; source?: unknown; refreshedAt?: unknown };
+      if (Array.isArray(d.models)) {
+        const list = d.models.filter(isModelInfo);
+        setModels(list);
+
+        // Keep the selection valid against the latest availability: if the
+        // selected model is missing or out of stock, fall back to Auto.
+        const prev = selectedModelRef.current;
+        const sel = list.find((m) => m.id === prev);
+        if (!sel || sel.availability === "out_of_stock") {
+          const label = sel ? `"${sel.displayName}"` : `"${prev}"`;
+          setModelNotice(`${label} is currently out of stock. Switched to Auto.`);
+          setSelectedModel(DEFAULT_MODEL);
+          selectedModelRef.current = DEFAULT_MODEL;
+        }
+      }
+      if (d.source === "ryzumi" || d.source === "fallback") {
+        setModelsSource(d.source);
+      }
+      if (typeof d.refreshedAt === "number") {
+        setModelsRefreshedAt(d.refreshedAt);
+      }
+    } catch {
+      /* keep the last known list */
+    } finally {
+      setModelsRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const restored = loadStoredModel() ?? DEFAULT_MODEL;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setMessages(loadStoredMessages());
+    setSelectedModel(restored);
+    selectedModelRef.current = restored;
     setHydrated(true);
-  }, []);
+    void refreshModels(false);
+  }, [refreshModels]);
 
   // Persist conversation.
   useEffect(() => {
@@ -70,6 +195,16 @@ export default function ChatPage() {
       /* storage full or unavailable — non-fatal */
     }
   }, [messages, hydrated]);
+
+  // Persist the selected model so it survives a page reload.
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      window.localStorage.setItem(MODEL_STORAGE_KEY, selectedModel);
+    } catch {
+      /* non-fatal */
+    }
+  }, [selectedModel, hydrated]);
 
   // Auto-scroll to the newest message.
   useEffect(() => {
@@ -86,101 +221,163 @@ export default function ChatPage() {
 
   useEffect(resizeTextarea, [input, resizeTextarea]);
 
+  // Close the model dropdown when clicking outside of it.
+  useEffect(() => {
+    if (!selectorOpen) return;
+    const onDown = (e: globalThis.MouseEvent) => {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
+        setSelectorOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [selectorOpen]);
+
   const busy = isLoading || isStreaming;
 
-  const sendConversation = useCallback(async (history: Message[]) => {
-    setError(null);
-    setIsLoading(true);
+  const selectedLabel = (() => {
+    const sel = models.find((m) => m.id === selectedModel);
+    if (sel) return sel.displayName;
+    return selectedModel === DEFAULT_MODEL ? "Auto" : selectedModel;
+  })();
 
-    const controller = new AbortController();
-    abortRef.current = controller;
+  const sendConversation = useCallback(
+    async (history: Message[]) => {
+      setError(null);
+      setIsLoading(true);
 
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history }),
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        let msg = `Request failed (status ${res.status}).`;
-        try {
-          const data: unknown = await res.json();
-          if (
-            typeof data === "object" &&
-            data !== null &&
-            typeof (data as { error?: unknown }).error === "string"
-          ) {
-            msg = (data as { error: string }).error;
-          }
-        } catch {
-          /* non-JSON error body */
+      // Defensive: never send with a model the latest availability says is
+      // unavailable. The server enforces this too.
+      if (models.length > 0) {
+        const sel = models.find((m) => m.id === selectedModel);
+        if (!sel || sel.availability === "out_of_stock") {
+          setError(
+            `The model "${sel?.displayName ?? selectedModel}" is currently unavailable. Please choose another model.`
+          );
+          setIsLoading(false);
+          return;
         }
-        throw new Error(msg);
       }
 
-      if (!res.body) {
-        throw new Error("The server returned an empty response.");
-      }
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-      // Stream the assistant reply into a new message.
-      setIsLoading(false);
-      setIsStreaming(true);
-      setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let full = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        full += decoder.decode(value, { stream: true });
-
-        let visible = full;
-        let streamError: string | null = null;
-        const idx = full.indexOf(STREAM_ERROR_MARKER);
-        if (idx !== -1) {
-          visible = full.slice(0, idx).trimEnd();
-          streamError = full.slice(idx + STREAM_ERROR_MARKER.length).trim();
-        }
-
-        setMessages((prev) => {
-          const next = [...prev];
-          next[next.length - 1] = { role: "assistant", content: visible };
-          return next;
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: history, model: selectedModel }),
+          signal: controller.signal,
         });
 
-        if (streamError) {
-          setError(streamError);
-          break;
+        if (!res.ok) {
+          let msg = `Request failed (status ${res.status}).`;
+          try {
+            const data: unknown = await res.json();
+            if (
+              typeof data === "object" &&
+              data !== null &&
+              typeof (data as { error?: unknown }).error === "string"
+            ) {
+              msg = (data as { error: string }).error;
+            }
+          } catch {
+            /* non-JSON error body */
+          }
+          throw new Error(msg);
         }
-      }
 
-      // If the stream produced no visible text and errored, drop the
-      // empty assistant bubble.
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.role === "assistant" && last.content.trim() === "") {
-          return prev.slice(0, -1);
+        if (!res.body) {
+          throw new Error("The server returned an empty response.");
         }
-        return prev;
-      });
-    } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
-        return; // user started a new chat / navigated away
+
+        // Stream the assistant reply into a new message.
+        setIsLoading(false);
+        setIsStreaming(true);
+        setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let full = "";
+        let failedModel: string | null = null;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          full += decoder.decode(value, { stream: true });
+
+          let visible = full;
+          let streamError: string | null = null;
+
+          const mIdx = full.indexOf(MODEL_UNAVAILABLE_MARKER);
+          if (mIdx !== -1) {
+            const after = full.slice(mIdx + MODEL_UNAVAILABLE_MARKER.length);
+            const nl = after.indexOf("\n");
+            failedModel = (nl === -1 ? after : after.slice(0, nl)).trim();
+            streamError = (
+              nl === -1
+                ? "The selected model is currently unavailable."
+                : after.slice(nl + 1)
+            ).trim();
+            visible = full.slice(0, mIdx).trimEnd();
+          } else {
+            const idx = full.indexOf(STREAM_ERROR_MARKER);
+            if (idx !== -1) {
+              visible = full.slice(0, idx).trimEnd();
+              streamError = full.slice(idx + STREAM_ERROR_MARKER.length).trim();
+            }
+          }
+
+          setMessages((prev) => {
+            const next = [...prev];
+            next[next.length - 1] = { role: "assistant", content: visible };
+            return next;
+          });
+
+          if (streamError) {
+            setError(streamError);
+            break;
+          }
+        }
+
+        // If the stream produced no visible text and errored, drop the
+        // empty assistant bubble.
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === "assistant" && last.content.trim() === "") {
+            return prev.slice(0, -1);
+          }
+          return prev;
+        });
+
+        // The chosen model disappeared mid-stream. Refresh availability so
+        // it gets disabled; the effect above then falls back to Auto.
+        if (failedModel) {
+          void refreshModels(false);
+        }
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          return; // user started a new chat / navigated away
+        }
+        const msg =
+          err instanceof Error && err.message
+            ? err.message
+            : "Something went wrong. Please check your connection and try again.";
+        setError(msg);
+      } finally {
+        setIsLoading(false);
+        setIsStreaming(false);
+        abortRef.current = null;
       }
-      const msg =
-        err instanceof Error && err.message
-          ? err.message
-          : "Something went wrong. Please check your connection and try again.";
-      setError(msg);
-    } finally {
-      setIsLoading(false);
-      setIsStreaming(false);
-      abortRef.current = null;
-    }
+    },
+    [selectedModel, models, refreshModels]
+  );
+
+  const handleSelectModel = useCallback((id: string) => {
+    setSelectedModel(id);
+    selectedModelRef.current = id;
+    setSelectorOpen(false);
+    setError(null);
   }, []);
 
   const handleSend = useCallback(async () => {
@@ -216,6 +413,7 @@ export default function ChatPage() {
     setMessages([]);
     setInput("");
     setError(null);
+    setModelNotice(null);
     setIsLoading(false);
     setIsStreaming(false);
     try {
@@ -239,6 +437,10 @@ export default function ChatPage() {
   };
 
   const hasMessages = messages.length > 0;
+  const grouped = groupModels(models);
+  const updatedLabel = modelsRefreshedAt
+    ? new Date(modelsRefreshedAt).toLocaleTimeString()
+    : "…";
 
   return (
     <div className="app">
@@ -247,15 +449,122 @@ export default function ChatPage() {
           <h1>Raphael</h1>
           <span>v0.1 · AI agent in development</span>
         </div>
-        <button
-          type="button"
-          className="newChatBtn"
-          onClick={handleNewChat}
-          disabled={!hasMessages && !busy}
-        >
-          New chat
-        </button>
+
+        <div className="headerRight">
+          <div className="modelPicker" ref={pickerRef}>
+            <span className="modelPickerLabel">Model</span>
+            <button
+              type="button"
+              className="modelPickerBtn"
+              onClick={() => setSelectorOpen((o) => !o)}
+              aria-haspopup="listbox"
+              aria-expanded={selectorOpen}
+              title={selectedLabel}
+            >
+              <span className="modelPickerName">{selectedLabel}</span>
+              <svg
+                className="modelCaret"
+                viewBox="0 0 24 24"
+                width="14"
+                height="14"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
+
+            {selectorOpen && (
+              <div className="modelDropdown" role="listbox" aria-label="Models">
+                <div className="modelDropdownTop">
+                  <span className="modelDropdownTitle">Models</span>
+                  <button
+                    type="button"
+                    className="modelRefreshBtn"
+                    onClick={() => void refreshModels(true)}
+                    disabled={modelsRefreshing}
+                  >
+                    {modelsRefreshing ? "Refreshing…" : "Refresh"}
+                  </button>
+                </div>
+
+                {grouped.map((g) => (
+                  <div key={g.group} className="modelGroup">
+                    <div className="modelGroupLabel">{g.group}</div>
+                    {g.models.map((m) => {
+                      const active = m.availability === "active";
+                      const isSelected = selectedModel === m.id;
+                      return (
+                        <button
+                          key={m.id}
+                          type="button"
+                          role="option"
+                          aria-selected={isSelected}
+                          className={`modelRow ${active ? "" : "modelRowDisabled"} ${
+                            isSelected ? "modelRowSelected" : ""
+                          }`}
+                          onClick={() => active && handleSelectModel(m.id)}
+                          disabled={!active}
+                        >
+                          <span
+                            className={`modelDot ${
+                              active ? "modelDotActive" : "modelDotOut"
+                            }`}
+                          />
+                          <span className="modelRowName">{m.displayName}</span>
+                          <span
+                            className={`modelStatus ${
+                              active ? "modelStatusActive" : "modelStatusOut"
+                            }`}
+                          >
+                            {active ? "ACTIVE" : "OUT OF STOCK"}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+
+                <div className="modelDropdownFoot">
+                  <span>
+                    Updated {updatedLabel} ·{" "}
+                    {modelsSource === "ryzumi"
+                      ? "live from Ryzumi"
+                      : "offline catalog"}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <button
+            type="button"
+            className="newChatBtn"
+            onClick={handleNewChat}
+            disabled={!hasMessages && !busy}
+          >
+            New chat
+          </button>
+        </div>
       </header>
+
+      {modelNotice && (
+        <div className="modelNotice" role="status">
+          <span>{modelNotice}</span>
+          <button
+            type="button"
+            className="modelNoticeBtn"
+            onClick={() => setModelNotice(null)}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       {hasMessages ? (
         <main className="messages" aria-live="polite">

@@ -34,3 +34,18 @@ export class AIProviderError extends Error {
     this.status = status;
   }
 }
+
+/**
+ * The requested model is not available upstream (model-not-found,
+ * out-of-stock, retired, etc.). Carries the exact model id so callers can
+ * disable it and refresh availability. The message is always safe to show
+ * the user — it never contains raw upstream error bodies.
+ */
+export class ModelUnavailableError extends AIProviderError {
+  model: string;
+  constructor(model: string, message = "The selected model is currently unavailable.") {
+    super(message, 409);
+    this.name = "ModelUnavailableError";
+    this.model = model;
+  }
+}
