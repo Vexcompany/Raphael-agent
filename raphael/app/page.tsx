@@ -111,6 +111,7 @@ export default function ChatPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeTools, setActiveTools] = useState<string[]>([]);
   const [hydrated, setHydrated] = useState(false);
 
   // Model selector state.
@@ -294,6 +295,7 @@ export default function ChatPage() {
         // Stream the assistant reply into a new message.
         setIsLoading(false);
         setIsStreaming(true);
+        setActiveTools([]);
         setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
         const reader = res.body.getReader();
@@ -306,12 +308,30 @@ export default function ChatPage() {
           if (done) break;
           full += decoder.decode(value, { stream: true });
 
-          let visible = full;
+          // Tool-activity lines are surfaced as a muted note, never rendered
+          // as markdown. Markers are small and emitted atomically.
+          const toolNames: string[] = [];
+          const toolRe = /\[RAPHAEL_TOOL\](\{[^}]*\})\n/g;
+          let toolMatch: RegExpExecArray | null;
+          toolRe.lastIndex = 0;
+          while ((toolMatch = toolRe.exec(full)) !== null) {
+            try {
+              const parsed = JSON.parse(toolMatch[1]) as { name?: unknown };
+              if (typeof parsed.name === "string" && parsed.name) {
+                toolNames.push(parsed.name);
+              }
+            } catch {
+              /* malformed activity line — skip */
+            }
+          }
+          if (toolNames.length > 0) setActiveTools(toolNames);
+
+          let visible = full.replace(toolRe, "");
           let streamError: string | null = null;
 
-          const mIdx = full.indexOf(MODEL_UNAVAILABLE_MARKER);
+          const mIdx = visible.indexOf(MODEL_UNAVAILABLE_MARKER);
           if (mIdx !== -1) {
-            const after = full.slice(mIdx + MODEL_UNAVAILABLE_MARKER.length);
+            const after = visible.slice(mIdx + MODEL_UNAVAILABLE_MARKER.length);
             const nl = after.indexOf("\n");
             failedModel = (nl === -1 ? after : after.slice(0, nl)).trim();
             streamError = (
@@ -319,12 +339,12 @@ export default function ChatPage() {
                 ? "The selected model is currently unavailable."
                 : after.slice(nl + 1)
             ).trim();
-            visible = full.slice(0, mIdx).trimEnd();
+            visible = visible.slice(0, mIdx).trimEnd();
           } else {
-            const idx = full.indexOf(STREAM_ERROR_MARKER);
+            const idx = visible.indexOf(STREAM_ERROR_MARKER);
             if (idx !== -1) {
-              visible = full.slice(0, idx).trimEnd();
-              streamError = full.slice(idx + STREAM_ERROR_MARKER.length).trim();
+              visible = visible.slice(0, idx).trimEnd();
+              streamError = visible.slice(idx + STREAM_ERROR_MARKER.length).trim();
             }
           }
 
@@ -414,6 +434,7 @@ export default function ChatPage() {
     setInput("");
     setError(null);
     setModelNotice(null);
+    setActiveTools([]);
     setIsLoading(false);
     setIsStreaming(false);
     try {
@@ -577,9 +598,16 @@ export default function ChatPage() {
                 <div className="msgBody">
                   {m.role === "assistant" ? (
                     m.content ? (
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {m.content}
-                      </ReactMarkdown>
+                      <>
+                        {i === messages.length - 1 && activeTools.length > 0 && (
+                          <div className="toolNote">
+                            Ran: {activeTools.join(" · ")}
+                          </div>
+                        )}
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {m.content}
+                        </ReactMarkdown>
+                      </>
                     ) : (
                       <div className="typing" aria-label="Raphael is typing">
                         <span /><span /><span />

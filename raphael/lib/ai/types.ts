@@ -1,14 +1,74 @@
-export type ChatRole = "user" | "assistant" | "system";
+export type ChatRole = "user" | "assistant" | "system" | "tool";
 
+/** A function-call request carried by an assistant message (OpenAI wire shape). */
+export interface ChatMessageToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+/**
+ * A single conversation turn.
+ *
+ * OpenAI-compatible shape so any provider speaking the chat-completions
+ * dialect can round-trip it unchanged:
+ * - assistant messages may carry `tool_calls` when they request tool use;
+ * - tool messages carry `tool_call_id` pointing at the call they answer.
+ */
 export interface ChatMessage {
   role: ChatRole;
   content: string;
+  tool_calls?: ChatMessageToolCall[];
+  tool_call_id?: string;
+}
+
+/** Tool a model may call, declared in the OpenAI `tools` wire format. */
+export interface ToolDefinition {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    /** JSON Schema describing the function arguments. */
+    parameters: Record<string, unknown>;
+  };
+}
+
+/** A tool call the model made, with its arguments already JSON-parsed. */
+export interface ParsedToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  /** Raw arguments string exactly as the model emitted it. */
+  rawArguments: string;
+}
+
+/** Result of executing a single tool call (safe text for the model). */
+export interface ToolResult {
+  call: ParsedToolCall;
+  ok: boolean;
+  output: string;
+}
+
+/**
+ * A unit of the assistant stream:
+ * - "text" — a chunk of markdown/text the client renders;
+ * - "tool_calls" — the model requested these tool calls (emitted once all
+ *   calls of the turn are known; the caller must run them and continue).
+ */
+export type AIStreamChunk =
+  | { type: "text"; text: string }
+  | { type: "tool_calls"; calls: ParsedToolCall[] };
+
+export interface StreamChatOptions {
+  signal?: AbortSignal;
+  /** Tool definitions sent to the provider. Omit for chat-only calls. */
+  tools?: ToolDefinition[];
 }
 
 /**
  * Minimal provider abstraction.
  *
- * Every AI backend Raphael talks to implements this single interface.
+ * Every AI backend the agent talks to implements this single interface.
  * Swapping models/providers later means adding another implementation
  * in lib/ai/provider.ts — nothing else in the app changes.
  */
@@ -17,12 +77,12 @@ export interface AIProvider {
   name: string;
   /**
    * Send a full conversation and receive the assistant reply as a
-   * stream of text chunks.
+   * stream of chunks (text and/or tool calls).
    */
   streamChat(
     messages: ChatMessage[],
-    signal?: AbortSignal
-  ): AsyncGenerator<string, void, unknown>;
+    options?: StreamChatOptions
+  ): AsyncGenerator<AIStreamChunk, void, unknown>;
 }
 
 /** Error with a safe, user-presentable message and an HTTP status hint. */

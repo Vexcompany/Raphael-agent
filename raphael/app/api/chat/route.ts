@@ -1,14 +1,17 @@
 import { getProvider } from "@/lib/ai/provider";
 import { invalidateModelsCache, validateModel } from "@/lib/ai/models";
-import { RAPHAEL_SYSTEM_PROMPT } from "@/lib/ai/systemPrompt";
+import { buildSystemPrompt } from "@/lib/ai/systemPrompt";
 import {
   AIProviderError,
   ChatMessage,
   ModelUnavailableError,
 } from "@/lib/ai/types";
+import { runChat } from "@/lib/agent/runChat";
+import { GITHUB_TOOLS } from "@/lib/github/tools";
+import { isGitHubConfigured } from "@/lib/github/auth";
 
 export const runtime = "nodejs";
-export const maxDuration = 60; // Vercel function limit hint
+export const maxDuration = 120; // Vercel function limit hint (tool rounds take time)
 
 const MAX_MESSAGES = 60; // most recent messages kept as context
 const MAX_MESSAGE_CHARS = 32_000;
@@ -18,6 +21,8 @@ const MAX_BODY_BYTES = 1_000_000;
 const MODEL_UNAVAILABLE_MARKER = "[RAPHAEL_MODEL_UNAVAILABLE]";
 /** Emitted in the stream for generic safe errors after headers are committed. */
 const STREAM_ERROR_MARKER = "[RAPHAEL_STREAM_ERROR]";
+/** Emitted before each tool execution so the client can show activity. */
+const TOOL_MARKER = "[RAPHAEL_TOOL]";
 
 interface ParsedBody {
   messages: ChatMessage[];
@@ -45,8 +50,8 @@ function parseBody(raw: unknown): ParsedBody | { error: string } {
     }
     const role = (m as { role?: unknown }).role;
     const content = (m as { content?: unknown }).content;
-    // Clients may only send user/assistant turns; the system prompt is
-    // controlled by the server.
+    // Clients may only send user/assistant turns; the system prompt and any
+    // tool/tool_calls messages are controlled by the server.
     if (role !== "user" && role !== "assistant") {
       return { error: "Message role must be 'user' or 'assistant'." };
     }
@@ -132,8 +137,15 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({ error: "Server configuration error." }, { status: 500 });
   }
 
+  // GitHub tools are wired in only when the server has App credentials.
+  // The system prompt is told the same truth so the model never claims a
+  // capability that is not actually available.
+  const githubConnected = isGitHubConfigured();
+  const systemPrompt = buildSystemPrompt(githubConnected);
+  const tools = githubConnected ? GITHUB_TOOLS : [];
+
   const messages: ChatMessage[] = [
-    { role: "system", content: RAPHAEL_SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt },
     ...parsed.messages,
   ];
 
@@ -143,9 +155,21 @@ export async function POST(req: Request): Promise<Response> {
     async start(controller) {
       try {
         let sentAnything = false;
-        for await (const chunk of provider.streamChat(messages, req.signal)) {
-          sentAnything = true;
-          controller.enqueue(encoder.encode(chunk));
+        for await (const event of runChat(provider, messages, tools, {
+          signal: req.signal,
+        })) {
+          if (event.type === "text") {
+            sentAnything = true;
+            controller.enqueue(encoder.encode(event.text));
+          } else {
+            // Compact, JSON-safe tool activity line; the client strips it
+            // from the rendered markdown.
+            controller.enqueue(
+              encoder.encode(
+                `\n\n${TOOL_MARKER}${JSON.stringify({ name: event.tool, ok: event.ok })}\n`
+              )
+            );
+          }
         }
         if (!sentAnything) {
           controller.enqueue(

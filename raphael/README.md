@@ -13,8 +13,9 @@ In v0.1 Raphael is a conversational assistant:
 - Model selector with live availability (Auto / all Ryzumi models, ACTIVE & OUT OF STOCK)
 - New-chat, loading, error, and retry states
 - Server-side AI provider abstraction — the provider is configured via environment variables and can be swapped without rewriting the app
+- **GitHub tools** (when the "Axiom AI RV" GitHub App is configured): inspect repositories, read/modify files, create branches, commit changes, open/merge PRs, and inspect Actions runs
 
-Not yet included (planned for later versions): tools, GitHub/Vercel integration, advanced model routing, persistence, auth, agents. Raphael will honestly say so if asked.
+Not yet included (planned for later versions): Vercel deployment, persistence, auth, advanced agents. The agent will honestly say so if asked.
 
 ## Tech stack
 
@@ -28,13 +29,19 @@ app/
   page.tsx            # Chat UI + model selector (client component)
   layout.tsx          # Root layout / metadata
   globals.css         # Styles
-  api/chat/route.ts   # Chat API: model validation, streaming, error handling
+  api/chat/route.ts   # Chat API: model validation, agent loop, streaming, errors
   api/models/route.ts # Model catalog + availability
 lib/ai/
-  types.ts            # AIProvider interface + ChatMessage types + errors
-  provider.ts         # Ryzumi provider implementation + factory
+  types.ts            # AIProvider interface + ChatMessage/Tool types + errors
+  provider.ts         # Ryzumi provider implementation + factory (tools + streaming)
   models.ts           # Model registry + availability (fallback + live /models)
-  systemPrompt.ts     # Raphael's identity (v0.1)
+  systemPrompt.ts     # Axiom AI RV identity + capability prompt
+lib/agent/
+  runChat.ts          # Server-side model <-> tools loop (streams to the client)
+lib/github/
+  auth.ts             # GitHub App JWT + installation access tokens (cached)
+  client.ts           # Typed GitHub REST helpers
+  tools.ts            # 13 GitHub tool definitions + dispatcher
 ```
 
 ## Local development
@@ -61,8 +68,14 @@ npx tsc --noEmit  # type check
 | `RYZUMI_API_KEY`   | ✅ yes   | Secret key for the Ryzumi AI API. Server-side only.                         |
 | `RYZUMI_BASE_URL`  | ✅ yes   | Base URL of the Ryzumi OpenAI-compatible API (default `https://ai.ryzumi.net/v1`). |
 | `RYZUMI_MODEL`     | no       | Server-side default model used only when a request omits `model`. The chat UI always sends the exact selected model id. |
+| `GITHUB_APP_ID`    | no       | GitHub App id. Enables the GitHub tools.                                    |
+| `GITHUB_CLIENT_ID` | no       | OAuth client id of the same GitHub App (not used server-side).             |
+| `GITHUB_CLIENT_SECRET` | no    | OAuth client secret of the same GitHub App (not used server-side).         |
+| `GITHUB_PRIVATE_KEY` | no     | GitHub App private key (PEM). Enables the GitHub tools.                    |
+| `GITHUB_BOT_NAME` / `GITHUB_BOT_EMAIL` | no | Identity used for commits authored by the agent.              |
+| `GITHUB_API_BASE_URL` | no | GitHub REST base URL override for tests/local proxies (default `https://api.github.com`). |
 
-All variables are read **only on the server** (inside the API routes). None are prefixed with `NEXT_PUBLIC_`, so they are never bundled into client code. If `RYZUMI_API_KEY` or `RYZUMI_BASE_URL` is missing, the chat API returns a clear 503 error instead of crashing.
+All variables are read **only on the server** (inside the API routes). None are prefixed with `NEXT_PUBLIC_`, so they are never bundled into client code. If `RYZUMI_API_KEY` or `RYZUMI_BASE_URL` is missing, the chat API returns a clear 503 error instead of crashing. If the GitHub App variables are missing, the chat API simply runs without GitHub tools.
 
 ### Example configuration
 
@@ -92,19 +105,51 @@ Raphael ships with an in-UI model selector (header, next to *New chat*). It is m
 - The server validates `model` against the catalog before streaming — unknown ids and out-of-stock models are rejected with a clear error and never reach the upstream call.
 - If a model disappears mid-stream, the client shows a concise error, refreshes availability, disables the model, keeps the conversation, and lets you pick another model and retry.
 
+## GitHub tools ("Axiom AI RV")
+
+When the `GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY` variables are configured, the agent gains real, server-side GitHub tools through the **Axiom AI RV** GitHub App. All calls are authenticated with short-lived **installation access tokens** minted from an app JWT — never a personal access token. Tokens are cached server-side until near expiry.
+
+Available tools (declared to the model via OpenAI-style function calling):
+
+| Tool                      | Purpose                                                              |
+| ------------------------- | -------------------------------------------------------------------- |
+| `list_repositories`       | Repos the app can access (optionally filtered by owner)              |
+| `inspect_repository`      | Repo metadata, default branch, language, size, last push             |
+| `inspect_file_tree`       | Recursive file tree of a branch                                      |
+| `list_repository_contents`| One directory's files/subdirectories                                 |
+| `read_file`               | Text content of a single file (capped at ~512KB)                     |
+| `create_branch`           | Create a branch from an existing base                                |
+| `create_or_update_file`   | Create/update one file with a commit message                         |
+| `commit_changes`          | Commit several files at once via the Git data API                    |
+| `open_pull_request`       | Open a PR (head → base)                                              |
+| `list_pull_requests`      | List PRs (open/closed/all)                                           |
+| `get_pull_request`        | PR details, changed files, reviews, mergeable state                  |
+| `merge_pull_request`      | Squash-merge a PR                                                    |
+| `inspect_workflow_runs`   | Actions runs/jobs + log tail for a branch or a specific run          |
+
+How it works:
+
+1. The server builds the system prompt with the real connected/not-connected state and passes the 13 tool definitions to the model.
+2. The model may call tools mid-conversation. `lib/agent/runChat.ts` executes each call server-side and feeds real results back so the model can continue reasoning.
+3. The client sees only the final streamed text plus a compact tool-activity line (`[RAPHAEL_TOOL]`); tool payloads, tokens, and GitHub responses are never sent to the browser.
+
+To set it up locally: create a GitHub App (repo scope + contents, pull requests, actions), install it on the account that owns the repo you want to test with, then put the app id, client id/secret, and PEM private key in your environment. The app must be installed on the target repo (e.g. `axiom-agent-test`).
+
 ## Production (Vercel)
 
 1. Push this repository to GitHub.
 2. In [Vercel](https://vercel.com), **Add New Project** → import the repo.
 3. Framework preset: **Next.js** (auto-detected). Build command `next build`, output handled automatically — no custom configuration needed.
-4. Add the environment variables (`RYZUMI_API_KEY`, `RYZUMI_BASE_URL`) under **Settings → Environment Variables** for the Production (and Preview) environments.
+4. Add the environment variables (`RYZUMI_API_KEY`, `RYZUMI_BASE_URL`, and optionally the `GITHUB_*` variables) under **Settings → Environment Variables** for the Production (and Preview) environments.
 5. Deploy.
 
-The chat route runs on the Node.js runtime with a 60s max duration (set via `maxDuration` in `app/api/chat/route.ts`).
+The chat route runs on the Node.js runtime with a 120s max duration (set via `maxDuration` in `app/api/chat/route.ts`), which accounts for multi-round tool use.
 
 ## Security notes (v0.1 baseline)
 
 - API keys live only in server-side env vars; never sent to or readable by the browser.
+- GitHub integration uses **GitHub App installation tokens** (short-lived, scoped per installation) — never a personal access token. Tokens, app JWTs, and the private key never leave the server or reach the model's context.
+- Tool results are consumed only by the model server-side; the browser receives streamed text and a compact `[RAPHAEL_TOOL]` activity line with no payloads.
 - `POST /api/chat` strictly validates input (roles, types, sizes, non-empty last user message) and caps body size.
 - The requested `model` is validated against the model catalog server-side — arbitrary ids are rejected and never passed to the upstream API.
 - Provider error bodies are never forwarded to the client — they are mapped to safe messages (no stack traces, no secrets).

@@ -1,4 +1,12 @@
-import { AIProvider, AIProviderError, ModelUnavailableError, ChatMessage } from "./types";
+import {
+  AIProvider,
+  AIProviderError,
+  ModelUnavailableError,
+  ChatMessage,
+  StreamChatOptions,
+  AIStreamChunk,
+  ParsedToolCall,
+} from "./types";
 
 /**
  * OpenAI-compatible chat-completions provider for Ryzumi AI.
@@ -55,12 +63,21 @@ class RyzumiProvider implements AIProvider {
 
   async *streamChat(
     messages: ChatMessage[],
-    signal?: AbortSignal
-  ): AsyncGenerator<string, void, unknown> {
+    options?: StreamChatOptions
+  ): AsyncGenerator<AIStreamChunk, void, unknown> {
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-    const combined = signal
-      ? AbortSignal.any([signal, timeout])
+    const combined = options?.signal
+      ? AbortSignal.any([options.signal, timeout])
       : timeout;
+
+    const body: Record<string, unknown> = {
+      model: this.model,
+      messages,
+      stream: true,
+    };
+    if (options?.tools && options.tools.length > 0) {
+      body.tools = options.tools;
+    }
 
     let res: Response;
     try {
@@ -70,11 +87,7 @@ class RyzumiProvider implements AIProvider {
           "Content-Type": "application/json",
           Authorization: `Bearer ${this.apiKey}`,
         },
-        body: JSON.stringify({
-          model: this.model,
-          messages,
-          stream: true,
-        }),
+        body: JSON.stringify(body),
         signal: combined,
       });
     } catch (err) {
@@ -130,8 +143,12 @@ class RyzumiProvider implements AIProvider {
     const decoder = new TextDecoder();
     let buffer = "";
 
+    // Tool calls arrive incrementally across chunks, keyed by `index`.
+    const toolCalls = new Map<number, { id: string; name: string; args: string }>();
+
     try {
-      while (true) {
+      let streamEnded = false;
+      while (!streamEnded) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -143,30 +160,95 @@ class RyzumiProvider implements AIProvider {
           const trimmed = line.trim();
           if (!trimmed.startsWith("data:")) continue;
           const data = trimmed.slice(5).trim();
-          if (data === "[DONE]") return;
+          if (data === "[DONE]") {
+            streamEnded = true;
+            break;
+          }
           let parsed: unknown;
           try {
             parsed = JSON.parse(data);
           } catch {
             continue; // tolerate malformed keep-alive lines
           }
-          const delta = extractDelta(parsed);
-          if (delta) yield delta;
+          const text = extractDeltaText(parsed);
+          if (text) yield { type: "text", text };
+          mergeToolCallDelta(parsed, toolCalls);
         }
       }
     } finally {
       reader.releaseLock();
     }
+
+    // Emit the complete set of tool calls once the turn is done so callers
+    // can execute them and continue the conversation.
+    if (toolCalls.size > 0) {
+      const calls: ParsedToolCall[] = [...toolCalls.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, tc]) => ({
+          id: tc.id || `call_${Math.random().toString(36).slice(2)}`,
+          name: tc.name || "",
+          rawArguments: tc.args,
+          arguments: parseToolArguments(tc.args),
+        }));
+      yield { type: "tool_calls", calls };
+    }
   }
 }
 
-function extractDelta(chunk: unknown): string | null {
+function extractDeltaText(chunk: unknown): string | null {
   if (typeof chunk !== "object" || chunk === null) return null;
   const choices = (chunk as { choices?: unknown }).choices;
   if (!Array.isArray(choices) || choices.length === 0) return null;
   const first = choices[0] as { delta?: { content?: unknown } };
   const content = first?.delta?.content;
   return typeof content === "string" ? content : null;
+}
+
+interface AccumToolCall {
+  id: string;
+  name: string;
+  args: string;
+}
+
+/** Merge incremental `delta.tool_calls` fragments into the accumulator. */
+function mergeToolCallDelta(chunk: unknown, acc: Map<number, AccumToolCall>): void {
+  if (typeof chunk !== "object" || chunk === null) return;
+  const choices = (chunk as { choices?: unknown }).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return;
+  const delta = (choices[0] as { delta?: { tool_calls?: unknown } })?.delta
+    ?.tool_calls;
+  if (!Array.isArray(delta)) return;
+
+  for (const raw of delta) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const item = raw as { index?: unknown; id?: unknown; function?: unknown };
+    if (typeof item.index !== "number") continue;
+    const fn = (item.function ?? null) as
+      | { name?: unknown; arguments?: unknown }
+      | null;
+
+    let entry = acc.get(item.index);
+    if (!entry) {
+      entry = { id: "", name: "", args: "" };
+      acc.set(item.index, entry);
+    }
+    if (typeof item.id === "string" && item.id) entry.id = item.id;
+    if (fn && typeof fn.name === "string" && fn.name) entry.name = fn.name;
+    if (fn && typeof fn.arguments === "string") entry.args += fn.arguments;
+  }
+}
+
+/** Parse a tool-call arguments string; anything malformed becomes {}. */
+function parseToolArguments(raw: string): Record<string, unknown> {
+  if (!raw.trim()) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 /**
