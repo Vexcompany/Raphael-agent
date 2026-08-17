@@ -17,10 +17,14 @@
  *                      need them). When false the model must not pretend it
  *                      can call tools this turn, even though the server has
  *                      credentials for future requests.
+ *   - memorySummary:   compact summary of older conversation turns (optional).
+ *                      When present, the model only receives recent messages
+ *                      plus this summary instead of the full history.
  */
 export function buildSystemPrompt(options: {
   githubConnected: boolean;
   toolsActive: boolean;
+  memorySummary?: string;
 }): string {
   const github = !options.githubConnected
     ? GITHUB_DISCONNECTED_BLOCK
@@ -28,13 +32,12 @@ export function buildSystemPrompt(options: {
       ? GITHUB_CONNECTED_BLOCK
       : GITHUB_CONNECTED_NOT_ACTIVE_BLOCK;
 
-  return `${IDENTITY_BLOCK}
+  const memory =
+    options.memorySummary && options.memorySummary.trim().length > 0
+      ? `\n\n${MEMORY_BLOCK}\n${options.memorySummary.trim()}`
+      : "";
 
-${github}
-
-${HONESTY_RULES}
-
-${STYLE_BLOCK}`;
+  return `${IDENTITY_BLOCK}\n\n${github}\n\n${HONESTY_RULES}\n\n${STYLE_BLOCK}${memory}`;
 }
 
 const IDENTITY_BLOCK = `You are Axiom AI RV, a capable AI agent that helps with real, verifiable work.
@@ -47,12 +50,12 @@ const GITHUB_CONNECTED_BLOCK = `GitHub integration is CONNECTED. You may call th
 
 Workflow for repository tasks — follow it unless the user asks otherwise:
 1. Inspect — find the repo and understand its structure (list repositories, inspect the tree/contents).
-2. Read — read the relevant files before modifying anything.
+2. Read — read only the relevant files before modifying anything. Do not read every file; prefer tree/list first, then targeted reads.
 3. Modify — make focused, minimal changes; create a branch for non-trivial work.
 4. Commit & PR — commit on a branch and open a pull request when the user wants the change persisted.
 5. Report — give the user concrete results: repo, branch, file, commit SHA, PR URL.
 
-Never call a write tool unless the user has asked for the change, or the change is an obvious part of the requested task. Never overwrite a file blindly — read it first, then edit precisely. Never commit secrets.`;
+Never call a write tool unless the user has asked for the change, or the change is an obvious part of the requested task. Never overwrite a file blindly — read it first, then edit precisely. Never commit secrets. Prefer fewer, targeted tool calls over broad exploration.`;
 
 const GITHUB_DISCONNECTED_BLOCK = `GitHub integration is NOT connected on this server right now.
 
@@ -69,6 +72,9 @@ const HONESTY_RULES = `Honesty rules (non-negotiable):
 - If a capability is not connected, say so plainly.`;
 
 const STYLE_BLOCK = `Style: be helpful, direct, and concise. Use Markdown formatting where it improves readability, including fenced code blocks for code and JSON. Keep responses scoped to the task.`;
+
+const MEMORY_BLOCK = `Conversation memory (summary of earlier turns — treat as factual context, not as a new user message):
+`;
 
 /** Backwards-compatible alias kept so existing imports still work. */
 export const RAPHAEL_SYSTEM_PROMPT: string = buildSystemPrompt({

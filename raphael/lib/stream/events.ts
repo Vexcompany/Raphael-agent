@@ -37,6 +37,13 @@ export type MessageSegment =
   | { type: "text"; text: string }
   | { type: "tool"; tool: string; ok: boolean };
 
+/** Cached conversation memory returned by the server for the next request. */
+export interface StreamMemoryPayload {
+  summary: string;
+  summarizedUntil: number;
+  messageCount: number;
+}
+
 export interface ParsedStream {
   /** Visible text only (tool markers and errors stripped). */
   visible: string;
@@ -56,7 +63,7 @@ export interface ParsedStream {
    * If the stream carried a memory marker, this is the summary payload
    * the client should cache for the next request.
    */
-  memorySummary: string | null;
+  memory: StreamMemoryPayload | null;
 }
 
 // ── Parser ─────────────────────────────────────────────────────────────────
@@ -72,7 +79,7 @@ export function parseStream(raw: string): ParsedStream {
   const segments: MessageSegment[] = [];
   let error: string | null = null;
   let failedModel: string | null = null;
-  let memorySummary: string | null = null;
+  let memory: StreamMemoryPayload | null = null;
 
   // Split on known markers while preserving the order.
   const MARKER_RE = /\n\n%%%(TOOL|ERR|MODEL_DOWN|MEMORY):/g;
@@ -116,15 +123,43 @@ export function parseStream(raw: string): ParsedStream {
     } else if (markerType === "MODEL_DOWN") {
       const nl = raw.indexOf("\n", payloadStart);
       failedModel = nl > -1 ? raw.slice(payloadStart, nl) : raw.slice(payloadStart);
-      lastIdx = nl > -1 ? nl + 1 : raw.length;
+      // Optional human message on the next line (kept in error path by the route).
+      if (nl > -1) {
+        const after = raw.slice(nl + 1);
+        const nextMarker = after.search(/\n\n%%%/);
+        const msg = nextMarker === -1 ? after : after.slice(0, nextMarker);
+        if (msg.trim() && !error) {
+          error = msg.trim();
+        }
+        lastIdx = nl + 1 + (nextMarker === -1 ? after.length : nextMarker);
+      } else {
+        lastIdx = raw.length;
+      }
     } else if (markerType === "MEMORY") {
-      // Payload: JSON string (the summary) followed by a newline.
+      // Payload: JSON object { summary, summarizedUntil, messageCount } or a bare string.
       const nl = raw.indexOf("\n", payloadStart);
       const payload = nl > -1 ? raw.slice(payloadStart, nl) : raw.slice(payloadStart);
       try {
         const parsed: unknown = JSON.parse(payload);
         if (typeof parsed === "string" && parsed.length > 0) {
-          memorySummary = parsed;
+          memory = { summary: parsed, summarizedUntil: 0, messageCount: 0 };
+        } else if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          typeof (parsed as { summary?: unknown }).summary === "string" &&
+          (parsed as { summary: string }).summary.length > 0
+        ) {
+          const p = parsed as {
+            summary: string;
+            summarizedUntil?: unknown;
+            messageCount?: unknown;
+          };
+          memory = {
+            summary: p.summary,
+            summarizedUntil:
+              typeof p.summarizedUntil === "number" ? p.summarizedUntil : 0,
+            messageCount: typeof p.messageCount === "number" ? p.messageCount : 0,
+          };
         }
       } catch {
         // Malformed memory marker — ignore.
@@ -145,5 +180,5 @@ export function parseStream(raw: string): ParsedStream {
     .map((s) => (s as { type: "text"; text: string }).text)
     .join("");
 
-  return { visible, segments, error, failedModel, memorySummary };
+  return { visible, segments, error, failedModel, memory };
 }
