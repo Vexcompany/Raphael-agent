@@ -52,17 +52,26 @@ export interface ToolResult {
 /**
  * A unit of the assistant stream:
  * - "text" — a chunk of markdown/text the client renders;
+ * - "reasoning" — a reasoning/thinking delta (never rendered to the user;
+ *   used only so callers know the model responded);
  * - "tool_calls" — the model requested these tool calls (emitted once all
  *   calls of the turn are known; the caller must run them and continue).
  */
 export type AIStreamChunk =
   | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
   | { type: "tool_calls"; calls: ParsedToolCall[] };
 
 export interface StreamChatOptions {
   signal?: AbortSignal;
   /** Tool definitions sent to the provider. Omit for chat-only calls. */
   tools?: ToolDefinition[];
+  /** Output token cap sent as `max_tokens` (0/undefined = unset). */
+  maxTokens?: number;
+  /** Wall-clock timeout for establishing the connection (ms). */
+  timeoutMs?: number;
+  /** Idle timeout between stream chunks (ms). 0 = disabled. */
+  idleTimeoutMs?: number;
 }
 
 /**
@@ -88,10 +97,13 @@ export interface AIProvider {
 /** Error with a safe, user-presentable message and an HTTP status hint. */
 export class AIProviderError extends Error {
   status: number;
-  constructor(message: string, status = 502) {
+  /** Machine-readable category: timeout | network | provider | malformed | empty | rate_limited | auth */
+  code?: string;
+  constructor(message: string, status = 502, code?: string) {
     super(message);
     this.name = "AIProviderError";
     this.status = status;
+    this.code = code;
   }
 }
 

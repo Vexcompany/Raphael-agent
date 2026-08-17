@@ -22,6 +22,8 @@ import { encodePath, encodeRef, ghData, ghRepo } from "./client";
 
 const MAX_READ_BYTES = 512_000;
 const MAX_TREE_ENTRIES = 2_000;
+/** Cap on a serialized tool result so big payloads never balloon later rounds. */
+const MAX_RESULT_CHARS = 60_000;
 
 /* ------------------------------------------------------------------ */
 /* Tool definitions                                                    */
@@ -286,7 +288,16 @@ function reqNumber(args: Args, key: string): number {
 }
 
 function okResult(call: ParsedToolCall, data: unknown): ToolResult {
-  return { call, ok: true, output: JSON.stringify(data, null, 2) };
+  const json = JSON.stringify(data, null, 2);
+  if (json.length <= MAX_RESULT_CHARS) {
+    return { call, ok: true, output: json };
+  }
+  const omitted = json.length - MAX_RESULT_CHARS;
+  return {
+    call,
+    ok: true,
+    output: `${json.slice(0, MAX_RESULT_CHARS)}\n\n[Result truncated: ${omitted} characters omitted. Use read_file / list_repository_contents for specific parts.]`,
+  };
 }
 
 function errResult(call: ParsedToolCall, message: string): ToolResult {

@@ -38,6 +38,7 @@ lib/ai/
   systemPrompt.ts     # Axiom AI RV identity + capability prompt
 lib/agent/
   runChat.ts          # Server-side model <-> tools loop (streams to the client)
+  needsTools.ts       # Whether a request plausibly needs the GitHub tool schema
 lib/github/
   auth.ts             # GitHub App JWT + installation access tokens (cached)
   client.ts           # Typed GitHub REST helpers
@@ -68,6 +69,9 @@ npx tsc --noEmit  # type check
 | `RYZUMI_API_KEY`   | ✅ yes   | Secret key for the Ryzumi AI API. Server-side only.                         |
 | `RYZUMI_BASE_URL`  | ✅ yes   | Base URL of the Ryzumi OpenAI-compatible API (default `https://ai.ryzumi.net/v1`). |
 | `RYZUMI_MODEL`     | no       | Server-side default model used only when a request omits `model`. The chat UI always sends the exact selected model id. |
+| `RYZUMI_MAX_TOKENS` | no      | Output token cap sent as `max_tokens` (default `1024`). Keeps every response — including tool-loop rounds — bounded. |
+| `RYZUMI_TIMEOUT_MS` | no      | Connect timeout in ms: how long to wait for the upstream response headers (default `30000`). |
+| `RYZUMI_IDLE_TIMEOUT_MS` | no | Max silence between stream chunks in ms (default `30000`). Catches a stream that stops mid-response. |
 | `GITHUB_APP_ID`    | no       | GitHub App id. Enables the GitHub tools.                                    |
 | `GITHUB_CLIENT_ID` | no       | OAuth client id of the same GitHub App (not used server-side).             |
 | `GITHUB_CLIENT_SECRET` | no    | OAuth client secret of the same GitHub App (not used server-side).         |
@@ -104,6 +108,7 @@ Raphael ships with an in-UI model selector (header, next to *New chat*). It is m
 
 - The server validates `model` against the catalog before streaming — unknown ids and out-of-stock models are rejected with a clear error and never reach the upstream call.
 - If a model disappears mid-stream, the client shows a concise error, refreshes availability, disables the model, keeps the conversation, and lets you pick another model and retry.
+- Failures are reported truthfully and distinctly, never as a generic "empty response": an upstream timeout surfaces as a timeout error (with any already-streamed partial output preserved), a malformed/unparseable stream as a malformed error, an upstream HTTP error as a provider error, and a genuinely empty response as "(The model returned an empty response.)".
 
 ## GitHub tools ("Axiom AI RV")
 
@@ -129,8 +134,8 @@ Available tools (declared to the model via OpenAI-style function calling):
 
 How it works:
 
-1. The server builds the system prompt with the real connected/not-connected state and passes the 13 tool definitions to the model.
-2. The model may call tools mid-conversation. `lib/agent/runChat.ts` executes each call server-side and feeds real results back so the model can continue reasoning.
+1. The server builds the system prompt with the real connected/not-connected state and passes the 13 tool definitions to the model **only when the request plausibly needs GitHub** (e.g. mentions a repo, PR, commit, file, etc.). Ordinary chat skips the ~1,600-token tool schema entirely and is told tools are not active for that turn.
+2. The model may call tools mid-conversation. `lib/agent/runChat.ts` executes each call server-side and feeds real results back so the model can continue reasoning. Tool results are capped (~60KB) before being re-sent so later rounds never balloon.
 3. The client sees only the final streamed text plus a compact tool-activity line (`[RAPHAEL_TOOL]`); tool payloads, tokens, and GitHub responses are never sent to the browser.
 
 To set it up locally: create a GitHub App (repo scope + contents, pull requests, actions), install it on the account that owns the repo you want to test with, then put the app id, client id/secret, and PEM private key in your environment. The app must be installed on the target repo (e.g. `axiom-agent-test`).

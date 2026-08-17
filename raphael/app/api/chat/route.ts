@@ -7,6 +7,7 @@ import {
   ModelUnavailableError,
 } from "@/lib/ai/types";
 import { runChat } from "@/lib/agent/runChat";
+import { likelyNeedsGitHub } from "@/lib/agent/needsTools";
 import { GITHUB_TOOLS } from "@/lib/github/tools";
 import { isGitHubConfigured } from "@/lib/github/auth";
 
@@ -137,12 +138,18 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({ error: "Server configuration error." }, { status: 500 });
   }
 
-  // GitHub tools are wired in only when the server has App credentials.
-  // The system prompt is told the same truth so the model never claims a
-  // capability that is not actually available.
+  // GitHub tools are attached only when (a) the server has App credentials
+  // and (b) this request plausibly needs them — ordinary chat skips the
+  // ~1,600-token tool schema entirely. The system prompt is told the same
+  // truth so the model never claims a capability that is not actually
+  // available in this turn.
   const githubConnected = isGitHubConfigured();
-  const systemPrompt = buildSystemPrompt(githubConnected);
-  const tools = githubConnected ? GITHUB_TOOLS : [];
+  const tools =
+    githubConnected && likelyNeedsGitHub(parsed.messages) ? GITHUB_TOOLS : [];
+  const systemPrompt = buildSystemPrompt({
+    githubConnected,
+    toolsActive: tools.length > 0,
+  });
 
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt },
