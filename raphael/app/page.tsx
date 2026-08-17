@@ -1,8 +1,9 @@
 "use client";
 
 import {
-  FormEvent,
-  KeyboardEvent,
+  type ReactNode,
+  type FormEvent,
+  type KeyboardEvent,
   useCallback,
   useEffect,
   useRef,
@@ -10,12 +11,19 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { parseStream, type MessageSegment } from "@/lib/stream/events";
 
 type Role = "user" | "assistant";
 
 interface Message {
   role: Role;
   content: string;
+  /**
+   * Ordered rendering segments for assistant messages (text interleaved with
+   * tool executions in their true chronological order). Absent for user
+   * messages and for assistant messages persisted by older builds.
+   */
+  segments?: MessageSegment[];
 }
 
 type ModelAvailability = "active" | "out_of_stock";
@@ -29,8 +37,6 @@ interface ModelInfo {
 
 const STORAGE_KEY = "raphael:conversation:v1";
 const MODEL_STORAGE_KEY = "raphael:model:v1";
-const STREAM_ERROR_MARKER = "[RAPHAEL_STREAM_ERROR]";
-const MODEL_UNAVAILABLE_MARKER = "[RAPHAEL_MODEL_UNAVAILABLE]";
 const DEFAULT_MODEL = "auto";
 
 const GROUP_ORDER = [
@@ -46,19 +52,35 @@ const GROUP_ORDER = [
   "Other",
 ];
 
+function isMessageSegment(v: unknown): v is MessageSegment {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as Record<string, unknown>;
+  if (o.type === "text") return typeof o.text === "string";
+  if (o.type === "tool") return typeof o.tool === "string" && typeof o.ok === "boolean";
+  return false;
+}
+
 function loadStoredMessages(): Message[] {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (m): m is Message =>
-        typeof m === "object" &&
-        m !== null &&
-        ((m as Message).role === "user" || (m as Message).role === "assistant") &&
-        typeof (m as Message).content === "string"
-    );
+    return parsed
+      .filter(
+        (m): m is Message =>
+          typeof m === "object" &&
+          m !== null &&
+          ((m as Message).role === "user" || (m as Message).role === "assistant") &&
+          typeof (m as Message).content === "string"
+      )
+      .map((m) => {
+        const msg = m as Message;
+        if (Array.isArray(msg.segments)) {
+          msg.segments = msg.segments.filter(isMessageSegment);
+        }
+        return msg;
+      });
   } catch {
     return [];
   }
@@ -92,6 +114,49 @@ interface ModelGroup {
   models: ModelInfo[];
 }
 
+/**
+ * Render an assistant message's ordered segments: text renders as Markdown,
+ * and consecutive tool executions render as a single muted "Ran: …" note at
+ * the exact position they occurred in the timeline.
+ */
+function renderSegments(segments: MessageSegment[]): ReactNode {
+  const nodes: ReactNode[] = [];
+  for (let i = 0; i < segments.length; ) {
+    const seg = segments[i];
+    if (seg.type === "tool") {
+      // Group consecutive tool executions into one "Ran: …" note, skipping
+      // the marker's framing whitespace that separates adjacent tool events.
+      const names = [seg.tool];
+      let j = i + 1;
+      while (j < segments.length) {
+        const next = segments[j];
+        if (next.type === "tool") {
+          names.push(next.tool);
+          j += 1;
+        } else if (next.text.trim() === "") {
+          j += 1; // whitespace-only separator between tools
+        } else {
+          break;
+        }
+      }
+      nodes.push(
+        <div key={`tool-${i}`} className="toolNote">
+          Ran: {names.join(" · ")}
+        </div>
+      );
+      i = j;
+    } else {
+      nodes.push(
+        <ReactMarkdown key={`text-${i}`} remarkPlugins={[remarkGfm]}>
+          {seg.text}
+        </ReactMarkdown>
+      );
+      i += 1;
+    }
+  }
+  return <>{nodes}</>;
+}
+
 function groupModels(models: ModelInfo[]): ModelGroup[] {
   const map = new Map<string, ModelInfo[]>();
   for (const g of GROUP_ORDER) map.set(g, []);
@@ -111,7 +176,6 @@ export default function ChatPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTools, setActiveTools] = useState<string[]>([]);
   const [hydrated, setHydrated] = useState(false);
 
   // Model selector state.
@@ -295,7 +359,6 @@ export default function ChatPage() {
         // Stream the assistant reply into a new message.
         setIsLoading(false);
         setIsStreaming(true);
-        setActiveTools([]);
         setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
         const reader = res.body.getReader();
@@ -308,63 +371,37 @@ export default function ChatPage() {
           if (done) break;
           full += decoder.decode(value, { stream: true });
 
-          // Tool-activity lines are surfaced as a muted note, never rendered
-          // as markdown. Markers are small and emitted atomically.
-          const toolNames: string[] = [];
-          const toolRe = /\[RAPHAEL_TOOL\](\{[^}]*\})\n/g;
-          let toolMatch: RegExpExecArray | null;
-          toolRe.lastIndex = 0;
-          while ((toolMatch = toolRe.exec(full)) !== null) {
-            try {
-              const parsed = JSON.parse(toolMatch[1]) as { name?: unknown };
-              if (typeof parsed.name === "string" && parsed.name) {
-                toolNames.push(parsed.name);
-              }
-            } catch {
-              /* malformed activity line — skip */
-            }
-          }
-          if (toolNames.length > 0) setActiveTools(toolNames);
-
-          let visible = full.replace(toolRe, "");
-          let streamError: string | null = null;
-
-          const mIdx = visible.indexOf(MODEL_UNAVAILABLE_MARKER);
-          if (mIdx !== -1) {
-            const after = visible.slice(mIdx + MODEL_UNAVAILABLE_MARKER.length);
-            const nl = after.indexOf("\n");
-            failedModel = (nl === -1 ? after : after.slice(0, nl)).trim();
-            streamError = (
-              nl === -1
-                ? "The selected model is currently unavailable."
-                : after.slice(nl + 1)
-            ).trim();
-            visible = visible.slice(0, mIdx).trimEnd();
-          } else {
-            const idx = visible.indexOf(STREAM_ERROR_MARKER);
-            if (idx !== -1) {
-              visible = visible.slice(0, idx).trimEnd();
-              streamError = visible.slice(idx + STREAM_ERROR_MARKER.length).trim();
-            }
-          }
+          // Re-parse the accumulated stream into ordered text/tool segments
+          // so tool executions render exactly where they occurred — never
+          // collected and prepended to the message afterward.
+          const parsed = parseStream(full);
 
           setMessages((prev) => {
             const next = [...prev];
-            next[next.length - 1] = { role: "assistant", content: visible };
+            next[next.length - 1] = {
+              role: "assistant",
+              content: parsed.visible,
+              segments: parsed.segments,
+            };
             return next;
           });
 
-          if (streamError) {
-            setError(streamError);
+          if (parsed.error) {
+            setError(parsed.error);
+            failedModel = parsed.failedModel;
             break;
           }
         }
 
-        // If the stream produced no visible text and errored, drop the
-        // empty assistant bubble.
+        // If the stream produced no visible text and no tool activity, drop
+        // the empty assistant bubble.
         setMessages((prev) => {
           const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.content.trim() === "") {
+          if (
+            last?.role === "assistant" &&
+            last.content.trim() === "" &&
+            (!last.segments || last.segments.length === 0)
+          ) {
             return prev.slice(0, -1);
           }
           return prev;
@@ -434,7 +471,6 @@ export default function ChatPage() {
     setInput("");
     setError(null);
     setModelNotice(null);
-    setActiveTools([]);
     setIsLoading(false);
     setIsStreaming(false);
     try {
@@ -597,17 +633,12 @@ export default function ChatPage() {
                 </span>
                 <div className="msgBody">
                   {m.role === "assistant" ? (
-                    m.content ? (
-                      <>
-                        {i === messages.length - 1 && activeTools.length > 0 && (
-                          <div className="toolNote">
-                            Ran: {activeTools.join(" · ")}
-                          </div>
-                        )}
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {m.content}
-                        </ReactMarkdown>
-                      </>
+                    m.segments && m.segments.length > 0 ? (
+                      renderSegments(m.segments)
+                    ) : m.content ? (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {m.content}
+                      </ReactMarkdown>
                     ) : (
                       <div className="typing" aria-label="Raphael is typing">
                         <span /><span /><span />

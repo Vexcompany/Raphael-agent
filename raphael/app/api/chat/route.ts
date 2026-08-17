@@ -10,6 +10,11 @@ import { runChat } from "@/lib/agent/runChat";
 import { likelyNeedsGitHub } from "@/lib/agent/needsTools";
 import { GITHUB_TOOLS } from "@/lib/github/tools";
 import { isGitHubConfigured } from "@/lib/github/auth";
+import {
+  MODEL_UNAVAILABLE_MARKER,
+  STREAM_ERROR_MARKER,
+  TOOL_MARKER,
+} from "@/lib/stream/events";
 
 export const runtime = "nodejs";
 export const maxDuration = 120; // Vercel function limit hint (tool rounds take time)
@@ -17,13 +22,6 @@ export const maxDuration = 120; // Vercel function limit hint (tool rounds take 
 const MAX_MESSAGES = 60; // most recent messages kept as context
 const MAX_MESSAGE_CHARS = 32_000;
 const MAX_BODY_BYTES = 1_000_000;
-
-/** Emitted in the stream when the upstream model turns out to be unavailable. */
-const MODEL_UNAVAILABLE_MARKER = "[RAPHAEL_MODEL_UNAVAILABLE]";
-/** Emitted in the stream for generic safe errors after headers are committed. */
-const STREAM_ERROR_MARKER = "[RAPHAEL_STREAM_ERROR]";
-/** Emitted before each tool execution so the client can show activity. */
-const TOOL_MARKER = "[RAPHAEL_TOOL]";
 
 interface ParsedBody {
   messages: ChatMessage[];
