@@ -26,6 +26,13 @@ interface Message {
   segments?: MessageSegment[];
 }
 
+/** Client-cached conversation memory (mirrors server MemoryPayload). */
+interface MemoryState {
+  summary: string;
+  summarizedUntil: number;
+  messageCount: number;
+}
+
 type ModelAvailability = "active" | "out_of_stock";
 
 interface ModelInfo {
@@ -36,6 +43,7 @@ interface ModelInfo {
 }
 
 const STORAGE_KEY = "raphael:conversation:v1";
+const MEMORY_STORAGE_KEY = "raphael:memory:v1";
 const MODEL_STORAGE_KEY = "raphael:model:v1";
 const DEFAULT_MODEL = "auto";
 
@@ -58,6 +66,17 @@ function isMessageSegment(v: unknown): v is MessageSegment {
   if (o.type === "text") return typeof o.text === "string";
   if (o.type === "tool") return typeof o.tool === "string" && typeof o.ok === "boolean";
   return false;
+}
+
+function isMemoryState(v: unknown): v is MemoryState {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as MemoryState).summary === "string" &&
+    (v as MemoryState).summary.length > 0 &&
+    typeof (v as MemoryState).summarizedUntil === "number" &&
+    typeof (v as MemoryState).messageCount === "number"
+  );
 }
 
 function loadStoredMessages(): Message[] {
@@ -83,6 +102,17 @@ function loadStoredMessages(): Message[] {
       });
   } catch {
     return [];
+  }
+}
+
+function loadStoredMemory(): MemoryState | null {
+  try {
+    const raw = window.localStorage.getItem(MEMORY_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return isMemoryState(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
 }
 
@@ -133,7 +163,7 @@ function renderSegments(segments: MessageSegment[]): ReactNode {
         if (next.type === "tool") {
           names.push(next.tool);
           j += 1;
-        } else if (next.text.trim() === "") {
+        } else if (next.type === "text" && next.text.trim() === "") {
           j += 1; // whitespace-only separator between tools
         } else {
           break;
@@ -177,6 +207,7 @@ export default function ChatPage() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [memory, setMemory] = useState<MemoryState | null>(null);
 
   // Model selector state.
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -193,12 +224,17 @@ export default function ChatPage() {
   const lastUserMessageRef = useRef<string | null>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
   const selectedModelRef = useRef<string>(DEFAULT_MODEL);
+  const memoryRef = useRef<MemoryState | null>(null);
 
   // Keep a plain ref in sync so async callbacks (refreshModels) can read the
   // latest selection without stale-closure issues.
   useEffect(() => {
     selectedModelRef.current = selectedModel;
   }, [selectedModel]);
+
+  useEffect(() => {
+    memoryRef.current = memory;
+  }, [memory]);
 
   // Restore the current conversation and model selection after a refresh.
   // This must happen post-mount (localStorage does not exist during SSR), so
@@ -245,6 +281,7 @@ export default function ChatPage() {
     const restored = loadStoredModel() ?? DEFAULT_MODEL;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setMessages(loadStoredMessages());
+    setMemory(loadStoredMemory());
     setSelectedModel(restored);
     selectedModelRef.current = restored;
     setHydrated(true);
@@ -260,6 +297,20 @@ export default function ChatPage() {
       /* storage full or unavailable — non-fatal */
     }
   }, [messages, hydrated]);
+
+  // Persist conversation memory.
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      if (memory) {
+        window.localStorage.setItem(MEMORY_STORAGE_KEY, JSON.stringify(memory));
+      } else {
+        window.localStorage.removeItem(MEMORY_STORAGE_KEY);
+      }
+    } catch {
+      /* non-fatal */
+    }
+  }, [memory, hydrated]);
 
   // Persist the selected model so it survives a page reload.
   useEffect(() => {
@@ -328,10 +379,20 @@ export default function ChatPage() {
       abortRef.current = controller;
 
       try {
+        const body: Record<string, unknown> = {
+          messages: history,
+          model: selectedModel,
+        };
+        // Resend cached memory so the server can skip re-summarizing.
+        const mem = memoryRef.current;
+        if (mem) {
+          body.memory = mem;
+        }
+
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: history, model: selectedModel }),
+          body: JSON.stringify(body),
           signal: controller.signal,
         });
 
@@ -365,6 +426,7 @@ export default function ChatPage() {
         const decoder = new TextDecoder();
         let full = "";
         let failedModel: string | null = null;
+        let gotMemory: MemoryState | null = null;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -386,11 +448,21 @@ export default function ChatPage() {
             return next;
           });
 
+          if (parsed.memory) {
+            gotMemory = parsed.memory;
+          }
+
           if (parsed.error) {
             setError(parsed.error);
             failedModel = parsed.failedModel;
             break;
           }
+        }
+
+        // Cache memory from this turn for the next request.
+        if (gotMemory) {
+          setMemory(gotMemory);
+          memoryRef.current = gotMemory;
         }
 
         // If the stream produced no visible text and no tool activity, drop
@@ -453,6 +525,7 @@ export default function ChatPage() {
   const handleRetry = useCallback(async () => {
     if (busy) return;
     // Re-send the conversation ending at the last user message.
+    // Drop a partial/failed assistant turn so it does not pollute context.
     let history = [...messages];
     while (history.length > 0 && history[history.length - 1].role !== "user") {
       history = history.slice(0, -1);
@@ -468,6 +541,8 @@ export default function ChatPage() {
   const handleNewChat = useCallback(() => {
     abortRef.current?.abort();
     setMessages([]);
+    setMemory(null);
+    memoryRef.current = null;
     setInput("");
     setError(null);
     setModelNotice(null);
@@ -475,6 +550,7 @@ export default function ChatPage() {
     setIsStreaming(false);
     try {
       window.localStorage.removeItem(STORAGE_KEY);
+      window.localStorage.removeItem(MEMORY_STORAGE_KEY);
     } catch {
       /* ignore */
     }
