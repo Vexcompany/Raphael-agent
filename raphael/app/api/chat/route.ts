@@ -17,7 +17,7 @@ import {
 } from "@/lib/stream/events";
 
 export const runtime = "nodejs";
-export const maxDuration = 120; // Vercel function limit hint (tool rounds take time)
+export const maxDuration = 290; // Hobby max is 300s; leave a small buffer for multi-tool agent runs
 
 const MAX_MESSAGES = 60; // most recent messages kept as context
 const MAX_MESSAGE_CHARS = 32_000;
