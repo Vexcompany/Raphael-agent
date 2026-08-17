@@ -11,6 +11,16 @@ import { likelyNeedsGitHub } from "@/lib/agent/needsTools";
 import { GITHUB_TOOLS } from "@/lib/github/tools";
 import { isGitHubConfigured } from "@/lib/github/auth";
 import {
+  isSummaryFresh,
+  summarizeConversation,
+} from "@/lib/memory/summarizer";
+import {
+  MIN_MESSAGES_FOR_SUMMARY,
+  RECENT_WINDOW,
+  type MemoryPayload,
+} from "@/lib/memory/types";
+import {
+  MEMORY_MARKER,
   MODEL_UNAVAILABLE_MARKER,
   STREAM_ERROR_MARKER,
   TOOL_MARKER,
@@ -19,17 +29,35 @@ import {
 export const runtime = "nodejs";
 export const maxDuration = 290; // Hobby max is 300s; leave a small buffer for multi-tool agent runs
 
-const MAX_MESSAGES = 60; // most recent messages kept as context
+const MAX_MESSAGES = 60; // most recent messages kept as context (before memory compaction)
 const MAX_MESSAGE_CHARS = 32_000;
 const MAX_BODY_BYTES = 1_000_000;
 
 interface ParsedBody {
   messages: ChatMessage[];
   model?: string;
+  memory?: MemoryPayload;
 }
 
 function badRequest(message: string, status = 400): Response {
   return Response.json({ error: message }, { status });
+}
+
+function parseMemory(raw: unknown): MemoryPayload | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.summary !== "string" || o.summary.trim() === "") return undefined;
+  if (typeof o.summarizedUntil !== "number" || !Number.isFinite(o.summarizedUntil)) {
+    return undefined;
+  }
+  if (typeof o.messageCount !== "number" || !Number.isFinite(o.messageCount)) {
+    return undefined;
+  }
+  return {
+    summary: o.summary.trim(),
+    summarizedUntil: Math.max(0, Math.floor(o.summarizedUntil)),
+    messageCount: Math.max(0, Math.floor(o.messageCount)),
+  };
 }
 
 /** Strictly validate and sanitize the request body. */
@@ -79,9 +107,11 @@ function parseBody(raw: unknown): ParsedBody | { error: string } {
     model = modelRaw;
   }
 
-  // Keep only the most recent context window.
+  const memory = parseMemory((raw as { memory?: unknown }).memory);
+
+  // Keep only the most recent context window before memory compaction.
   const trimmed = clean.slice(-MAX_MESSAGES);
-  return { messages: trimmed, model };
+  return { messages: trimmed, model, memory };
 }
 
 export async function POST(req: Request): Promise<Response> {
@@ -136,6 +166,44 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({ error: "Server configuration error." }, { status: 500 });
   }
 
+  // ── Memory compaction ───────────────────────────────────────────────────
+  // Prefer a fresh client-cached summary. Otherwise summarize older turns
+  // (best-effort). When a summary is available we only send the recent
+  // window to the model, which keeps token usage bounded.
+  let memoryOut: MemoryPayload | null = null;
+  const clientMemory = parsed.memory;
+  const allMessages = parsed.messages;
+
+  if (
+    clientMemory &&
+    isSummaryFresh(
+      allMessages.length,
+      clientMemory.summarizedUntil,
+      clientMemory.messageCount
+    )
+  ) {
+    memoryOut = clientMemory;
+  } else if (allMessages.length >= MIN_MESSAGES_FOR_SUMMARY) {
+    try {
+      const result = await summarizeConversation(provider, allMessages);
+      if (result) {
+        memoryOut = {
+          summary: result.summary,
+          summarizedUntil: result.summarizedUntil,
+          messageCount: result.messageCount,
+        };
+      }
+    } catch {
+      // Best-effort; fall back to sending recent messages without summary.
+      memoryOut = null;
+    }
+  }
+
+  const recentMessages =
+    memoryOut && allMessages.length > RECENT_WINDOW
+      ? allMessages.slice(-RECENT_WINDOW)
+      : allMessages;
+
   // GitHub tools are attached only when (a) the server has App credentials
   // and (b) this request plausibly needs them — ordinary chat skips the
   // ~1,600-token tool schema entirely. The system prompt is told the same
@@ -147,11 +215,12 @@ export async function POST(req: Request): Promise<Response> {
   const systemPrompt = buildSystemPrompt({
     githubConnected,
     toolsActive: tools.length > 0,
+    memorySummary: memoryOut?.summary,
   });
 
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt },
-    ...parsed.messages,
+    ...recentMessages,
   ];
 
   const encoder = new TextEncoder();
@@ -168,10 +237,10 @@ export async function POST(req: Request): Promise<Response> {
             controller.enqueue(encoder.encode(event.text));
           } else {
             // Compact, JSON-safe tool activity line; the client strips it
-            // from the rendered markdown.
+            // from the rendered markdown. Markers already include leading newlines.
             controller.enqueue(
               encoder.encode(
-                `\n\n${TOOL_MARKER}${JSON.stringify({ name: event.tool, ok: event.ok })}\n`
+                `${TOOL_MARKER}${JSON.stringify({ name: event.tool, ok: event.ok })}\n`
               )
             );
           }
@@ -179,6 +248,12 @@ export async function POST(req: Request): Promise<Response> {
         if (!sentAnything) {
           controller.enqueue(
             encoder.encode("(The model returned an empty response.)")
+          );
+        }
+        // Emit memory payload so the client can cache it for the next turn.
+        if (memoryOut) {
+          controller.enqueue(
+            encoder.encode(`${MEMORY_MARKER}${JSON.stringify(memoryOut)}\n`)
           );
         }
         controller.close();
@@ -194,7 +269,7 @@ export async function POST(req: Request): Promise<Response> {
             invalidateModelsCache();
             controller.enqueue(
               encoder.encode(
-                `\n\n${MODEL_UNAVAILABLE_MARKER}${err.model}\n${err.message}`
+                `${MODEL_UNAVAILABLE_MARKER}${err.model}\n${err.message}`
               )
             );
           } else {
@@ -202,7 +277,9 @@ export async function POST(req: Request): Promise<Response> {
               err instanceof AIProviderError
                 ? err.message
                 : "An unexpected error occurred while generating the response.";
-            controller.enqueue(encoder.encode(`\n\n${STREAM_ERROR_MARKER}${safe}`));
+            controller.enqueue(
+              encoder.encode(`${STREAM_ERROR_MARKER}${safe}\n`)
+            );
           }
           controller.close();
         } catch {
