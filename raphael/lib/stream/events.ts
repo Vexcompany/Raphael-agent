@@ -1,165 +1,149 @@
 /**
- * Shared streaming-event parsing for the Raphael agent.
+ * Stream event markers and parser shared by the chat route and the client.
  *
- * The chat route interleaves plain text and compact `[RAPHAEL_TOOL]`
- * activity markers in a single byte stream, in the exact chronological order
- * the agent produced them (assistant text, then tool executions, then more
- * assistant text, and so on). This module turns that raw accumulated text
- * back into an ordered list of segments so the UI can render assistant text,
- * tool calls, and the text that follows them in their true order — instead
- * of collecting every tool call and prepending it to the message.
+ * The server emits a plain-text stream where tool executions and errors are
+ * embedded as compact JSON lines behind a marker prefix. The client parses
+ * the stream to extract visible markdown, ordered tool-activity segments,
+ * and error messages.
  *
- * The marker strings must match the ones emitted by `app/api/chat/route.ts`;
- * they are re-exported here so both the server route and the client parser
- * share a single source of truth.
- *
- * This module is deliberately dependency-free (no React/Next/server imports)
- * so it can be unit-tested in isolation.
+ * All markers are chosen so they never appear in normal AI-generated
+ * Markdown output.
  */
+
+// ── Markers ────────────────────────────────────────────────────────────────
+
+/** Prefix for a compact tool-execution event line. */
+export const TOOL_MARKER = "\n\n%%%TOOL:";
+
+/** Prefix for a stream-level error event line. */
+export const STREAM_ERROR_MARKER = "\n\n%%%ERR:";
+
+/**
+ * Prefix for a model-unavailable event line. The model id follows the
+ * marker, then a newline, then the human-readable message.
+ */
+export const MODEL_UNAVAILABLE_MARKER = "\n\n%%%MODEL_DOWN:";
+
+/**
+ * Prefix for a memory/summary event line. The client caches this summary
+ * and sends it back on the next request so the server doesn't need to
+ * re-summarize on every turn.
+ */
+export const MEMORY_MARKER = "\n\n%%%MEMORY:";
+
+// ── Segment types ──────────────────────────────────────────────────────────
 
 export type MessageSegment =
   | { type: "text"; text: string }
   | { type: "tool"; tool: string; ok: boolean };
 
-/** Emitted before each tool execution so the client can show activity. */
-export const TOOL_MARKER = "[RAPHAEL_TOOL]";
-/** Emitted in the stream for generic safe errors after headers are committed. */
-export const STREAM_ERROR_MARKER = "[RAPHAEL_STREAM_ERROR]";
-/** Emitted in the stream when the upstream model turns out to be unavailable. */
-export const MODEL_UNAVAILABLE_MARKER = "[RAPHAEL_MODEL_UNAVAILABLE]";
-
 export interface ParsedStream {
-  /** Ordered text/tool segments exactly as they occurred in the stream. */
-  segments: MessageSegment[];
-  /** Concatenated visible text (tool markers and error trailers removed). */
+  /** Visible text only (tool markers and errors stripped). */
   visible: string;
-  /** Error message surfaced mid-stream, if any. */
+  /** Ordered text/tool segments for timeline rendering. */
+  segments: MessageSegment[];
+  /**
+   * If the stream ended with an error marker, this is the human-readable
+   * error message. Null otherwise.
+   */
   error: string | null;
-  /** Model id that failed mid-stream, if any. */
+  /**
+   * If the stream carried a model-unavailable marker, this is the model id
+   * that failed. Null otherwise.
+   */
   failedModel: string | null;
+  /**
+   * If the stream carried a memory marker, this is the summary payload
+   * the client should cache for the next request.
+   */
+  memorySummary: string | null;
 }
+
+// ── Parser ─────────────────────────────────────────────────────────────────
 
 /**
- * Find the exclusive end index of a complete tool marker beginning at
- * `start`, or -1 when the marker has not fully arrived yet (e.g. it was
- * split across a chunk boundary).
- */
-function findToolMarkerEnd(s: string, start: number): number {
-  const open = s.indexOf("{", start + TOOL_MARKER.length);
-  if (open === -1) return -1;
-  const close = s.indexOf("}", open);
-  if (close === -1) return -1;
-  const nl = s.indexOf("\n", close);
-  if (nl === -1) return -1;
-  return nl + 1;
-}
-
-function parseToolMarker(s: string, start: number, end: number): MessageSegment {
-  const open = s.indexOf("{", start);
-  const close = s.lastIndexOf("}", end - 1);
-  let tool = "unknown";
-  let ok = false;
-  if (open !== -1 && close > open) {
-    try {
-      const parsed = JSON.parse(s.slice(open, close + 1)) as {
-        name?: unknown;
-        ok?: unknown;
-      };
-      tool = typeof parsed.name === "string" && parsed.name ? parsed.name : "unknown";
-      ok = parsed.ok === true;
-    } catch {
-      /* malformed marker body — keep the safe defaults */
-    }
-  }
-  return { type: "tool", tool, ok };
-}
-
-/**
- * Append a text run, dropping the marker framing whitespace (the route emits
- * `\n\n` before every tool/error marker purely as a separator) and skipping
- * whitespace-only runs so no empty markdown blocks are rendered.
- */
-function pushText(segments: MessageSegment[], text: string): void {
-  const trimmed = text.trimEnd();
-  if (trimmed) {
-    segments.push({ type: "text", text: trimmed });
-  }
-}
-
-/** Split a tool-marker-free string into ordered text/tool segments. */
-function tokenize(raw: string): MessageSegment[] {
-  const segments: MessageSegment[] = [];
-  let pos = 0;
-
-  while (pos < raw.length) {
-    const mStart = raw.indexOf(TOOL_MARKER, pos);
-    if (mStart === -1) break;
-    const mEnd = findToolMarkerEnd(raw, mStart);
-    if (mEnd === -1) break; // incomplete trailing marker — held back
-    if (mStart > pos) {
-      pushText(segments, raw.slice(pos, mStart));
-    }
-    segments.push(parseToolMarker(raw, mStart, mEnd));
-    pos = mEnd;
-  }
-
-  // Whatever remains is text, unless it starts with a not-yet-complete
-  // marker (which must be withheld so it never renders as literal text).
-  let tail = raw.slice(pos);
-  const pendingIdx = tail.indexOf(TOOL_MARKER);
-  if (pendingIdx !== -1) {
-    tail = tail.slice(0, pendingIdx);
-  }
-  pushText(segments, tail);
-
-  return segments;
-}
-
-/**
- * Split the accumulated raw stream into ordered segments plus any trailing
- * error state. Re-running this on the growing buffer on every chunk is
- * idempotent and cheap: the stream is bounded and markers are tiny.
+ * Parse a partially-accumulated stream into visible text, ordered
+ * text/tool segments, and any error or model-unavailable markers.
+ *
+ * Safe to call on every chunk — it re-parses the entire accumulated
+ * string each time, which is cheap for typical conversation lengths.
  */
 export function parseStream(raw: string): ParsedStream {
+  const segments: MessageSegment[] = [];
   let error: string | null = null;
   let failedModel: string | null = null;
+  let memorySummary: string | null = null;
 
-  // Error trailers terminate the stream, so cut there first. Prefer the
-  // earliest of the two markers (they cannot overlap).
-  const mIdx = raw.indexOf(MODEL_UNAVAILABLE_MARKER);
-  const sIdx = raw.indexOf(STREAM_ERROR_MARKER);
-  let cutAt = -1;
-  let modelUnavailable = false;
-  if (mIdx !== -1 && (sIdx === -1 || mIdx < sIdx)) {
-    cutAt = mIdx;
-    modelUnavailable = true;
-  } else if (sIdx !== -1) {
-    cutAt = sIdx;
-  }
+  // Split on known markers while preserving the order.
+  const MARKER_RE = /\n\n%%%(TOOL|ERR|MODEL_DOWN|MEMORY):/g;
 
-  let body = raw;
-  if (cutAt !== -1) {
-    const marker = modelUnavailable ? MODEL_UNAVAILABLE_MARKER : STREAM_ERROR_MARKER;
-    const after = raw.slice(cutAt + marker.length);
-    if (modelUnavailable) {
-      const nl = after.indexOf("\n");
-      failedModel = (nl === -1 ? after : after.slice(0, nl)).trim();
-      error = (
-        nl === -1
-          ? "The selected model is currently unavailable."
-          : after.slice(nl + 1)
-      ).trim();
-    } else {
-      error = after.trim();
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = MARKER_RE.exec(raw)) !== null) {
+    // Text before this marker.
+    const before = raw.slice(lastIdx, match.index);
+    if (before) {
+      segments.push({ type: "text", text: before });
     }
-    body = raw.slice(0, cutAt);
+
+    const markerType = match[1];
+    const payloadStart = match.index + match[0].length;
+
+    if (markerType === "TOOL") {
+      // Payload: JSON { name, ok } followed by a newline.
+      const nl = raw.indexOf("\n", payloadStart);
+      const payload = nl > -1 ? raw.slice(payloadStart, nl) : raw.slice(payloadStart);
+      try {
+        const parsed: unknown = JSON.parse(payload);
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          typeof (parsed as { name?: unknown }).name === "string" &&
+          typeof (parsed as { ok?: unknown }).ok === "boolean"
+        ) {
+          const p = parsed as { name: string; ok: boolean };
+          segments.push({ type: "tool", tool: p.name, ok: p.ok });
+        }
+      } catch {
+        // Malformed tool marker — ignore.
+      }
+      lastIdx = nl > -1 ? nl + 1 : payloadStart;
+    } else if (markerType === "ERR") {
+      const nl = raw.indexOf("\n", payloadStart);
+      error = nl > -1 ? raw.slice(payloadStart, nl) : raw.slice(payloadStart);
+      lastIdx = nl > -1 ? nl + 1 : raw.length;
+    } else if (markerType === "MODEL_DOWN") {
+      const nl = raw.indexOf("\n", payloadStart);
+      failedModel = nl > -1 ? raw.slice(payloadStart, nl) : raw.slice(payloadStart);
+      lastIdx = nl > -1 ? nl + 1 : raw.length;
+    } else if (markerType === "MEMORY") {
+      // Payload: JSON string (the summary) followed by a newline.
+      const nl = raw.indexOf("\n", payloadStart);
+      const payload = nl > -1 ? raw.slice(payloadStart, nl) : raw.slice(payloadStart);
+      try {
+        const parsed: unknown = JSON.parse(payload);
+        if (typeof parsed === "string" && parsed.length > 0) {
+          memorySummary = parsed;
+        }
+      } catch {
+        // Malformed memory marker — ignore.
+      }
+      lastIdx = nl > -1 ? nl + 1 : raw.length;
+    }
   }
 
-  const segments = tokenize(body);
-  const visible = segments
-    .filter((s): s is Extract<MessageSegment, { type: "text" }> => s.type === "text")
-    .map((s) => s.text)
-    .join("\n\n");
+  // Remaining text after the last marker.
+  const after = raw.slice(lastIdx);
+  if (after) {
+    segments.push({ type: "text", text: after });
+  }
 
-  return { segments, visible, error, failedModel };
+  // Build visible text from segments (tool segments are invisible).
+  const visible = segments
+    .filter((s) => s.type === "text")
+    .map((s) => (s as { type: "text"; text: string }).text)
+    .join("");
+
+  return { visible, segments, error, failedModel, memorySummary };
 }
